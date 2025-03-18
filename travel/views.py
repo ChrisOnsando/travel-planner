@@ -14,58 +14,55 @@ class TripPlannerView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        driver = DriverProfile.objects.get(user=request.user)
+        driver, created = DriverProfile.objects.get_or_create(user=request.user)
         data = request.data.copy()
         data['driver'] = driver.id
         serializer = TripSerializer(data=data)
-
         if serializer.is_valid():
             trip = serializer.save()
             route = self.get_route_with_traffic(trip)
-            
-            if not route:
-                return Response({"error": "Could not retrieve route details"}, status=400)
-
-            try:
-                plan = self.plan_trip(route, trip.cycle_used)
-            except ValueError as e:
-                return Response({"error": str(e)}, status=400)
-
+            plan = self.plan_trip(route, trip.cycle_used)
             self.save_logs(trip, plan)
             pdf_path = self.generate_detailed_logs(trip, plan)
-
             driver.cycle_hours_remaining -= sum(day['driving'] for day in plan)
             driver.save()
-
             return Response({
                 'route': route,
                 'plan': plan,
                 'pdf_path': pdf_path,
                 'remaining_hours': driver.cycle_hours_remaining
             })
-
         return Response(serializer.errors, status=400)
 
     def get_route_with_traffic(self, trip):
-        api_key = config('MAP_BOX_API_KEY')
+        access_token = config('MAPBOX_ACCESS_TOKEN')
         cache_key = f"route_{trip.current_location}_{trip.pickup_location}_{trip.dropoff_location}"
         cached_route = cache.get(cache_key)
-
         if cached_route:
             return cached_route
 
-        url = f"https://maps.googleapis.com/maps/api/directions/json?origin={trip.current_location}&waypoints={trip.pickup_location}&destination={trip.dropoff_location}&departure_time=now&traffic_model=best_guess&key={api_key}"
+        locations = [trip.current_location, trip.pickup_location, trip.dropoff_location]
+        coordinates = []
+        for loc in locations:
+            geo_url = f"https://api.mapbox.com/geocoding/v5/mapbox.places/{loc}.json?access_token={access_token}"
+            geo_response = requests.get(geo_url).json()
+            coordinates.append(geo_response['features'][0]['center'])
+
+        coords_str = ';'.join(f"{lon},{lat}" for lon, lat in coordinates)
+        url = f"https://api.mapbox.com/directions/v5/mapbox/driving-traffic/{coords_str}?access_token={access_token}&geometries=geojson"
         response = requests.get(url).json()
-
-        if 'routes' not in response or not response['routes']:
-            return None  
-
-        distance = sum(leg['distance']['value'] for leg in response['routes'][0]['legs']) / 1609.34  # Convert meters to miles
-        duration = sum(leg['duration_in_traffic']['value'] for leg in response['routes'][0]['legs']) / 3600  # Convert seconds to hours
-
-        route = {'distance': distance, 'duration': duration, 'path': response['routes'][0]}
+        
+        distance = response['routes'][0]['distance'] / 1609.34
+        duration = response['routes'][0]['duration'] / 3600
+        route = {
+            'distance': distance,
+            'duration': duration,
+            'path': {
+                'geometry': response['routes'][0]['geometry'],
+                'legs': [{'end_location': coord} for coord in coordinates[1:]]
+            }
+        }
         cache.set(cache_key, route, timeout=3600)
-
         return route
 
     def plan_trip(self, route, cycle_used):
@@ -82,11 +79,8 @@ class TripPlannerView(APIView):
         days = []
         current_time = 0
         current_distance = 0
-
         while current_time < total_time:
             day = {'driving': 0, 'on_duty': 0, 'stops': []}
-            
-            # Start of duty (first hour)
             if not days:
                 day['on_duty'] += 1
                 current_time += 1
@@ -95,21 +89,23 @@ class TripPlannerView(APIView):
             day['driving'] = daily_driving
             day['on_duty'] += daily_driving
             current_time += daily_driving
-            current_distance += daily_driving * 55
+            current_distance += (daily_driving / driving_time) * total_distance
 
-            # Fueling Stops
             if current_distance >= 1000:
                 day['stops'].append(f"Fueling at mile {int(current_distance)}")
                 day['on_duty'] += 0.5
                 current_time += 0.5
                 current_distance %= 1000
 
-            # End of duty
-            day['on_duty'] = min(day['on_duty'], 14)
-            current_time += 10 
+            if current_time >= total_time - 1:
+                day['on_duty'] += 1
+                current_time += 1
 
+            if day['on_duty'] > 14:
+                day['on_duty'] = 14
+                current_time = len(days) * 24 + 14
             days.append(day)
-
+            current_time += 10
         return days
 
     def save_logs(self, trip, plan):
@@ -123,46 +119,43 @@ class TripPlannerView(APIView):
             )
 
     def generate_detailed_logs(self, trip, plan):
-        pdf_path = f"media/logs_trip_{trip.id}.pdf"
-        os.makedirs(os.path.dirname(pdf_path), exist_ok=True) 
+        static_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'static')
+        os.makedirs(static_dir, exist_ok=True)
+        
+        pdf_path = os.path.join(static_dir, f"logs_trip_{trip.id}.pdf")
         c = canvas.Canvas(pdf_path, pagesize=letter)
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(50, 780, "Trip Planner Pro - ELD Log")
+        c.setFont("Helvetica", 10)
+        c.drawString(50, 760, f"Trip ID: {trip.id} | Driver: {trip.driver.user.username}")
+        c.line(50, 755, 550, 755)
 
-        total_time = sum(day['on_duty'] for day in plan) 
-        current_time = 0
-
+        total_time = sum(day['driving'] + (0.5 * len(day['stops'])) + (1 if i == 0 or i == len(plan) - 1 else 0) for i, day in enumerate(plan))
         for i, day in enumerate(plan):
             c.setFont("Helvetica", 12)
-            c.drawString(50, 750, f"Day {i+1} - Trip ID: {trip.id}")
-
+            c.drawString(50, 730 - i * 100, f"Day {i+1}")
             for x in range(50, 650, 6):
-                c.line(x, 700, x, 650)
-
-            y = 700
+                c.line(x, 700 - i * 100, x, 650 - i * 100)
+            for hour in range(0, 25, 2):
+                c.drawString(50 + hour * 24, 635 - i * 100, f"{hour}:00")
+            y = 700 - i * 100
             current_x = 50
-
             if i == 0:
                 c.setFillColorRGB(0, 0, 1)
                 c.rect(current_x, y-50, 24, 50, fill=1)
                 current_x += 24
-                current_time += 1
-
             driving_segments = int(day['driving'] * 4)
             c.setFillColorRGB(0, 1, 0)
             c.rect(current_x, y-50, driving_segments * 6, 50, fill=1)
             current_x += driving_segments * 6
-            current_time += day['driving']
-
             for stop in day['stops']:
                 c.setFillColorRGB(1, 1, 0)
                 c.rect(current_x, y-50, 2 * 6, 50, fill=1)
                 current_x += 12
-                current_time += 0.5
-
-            if current_time >= total_time - 1:
+            if i == len(plan) - 1: 
                 c.setFillColorRGB(0, 0, 1)
                 c.rect(current_x, y-50, 24, 50, fill=1)
-
-            c.showPage()
-
+            if i < len(plan) - 1:
+                c.showPage()
         c.save()
-        return pdf_path
+        return f"static/logs_trip_{trip.id}.pdf"
