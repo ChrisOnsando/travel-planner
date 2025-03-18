@@ -13,6 +13,7 @@ redis = "5.2.1"
 requests = "2.32.3"
 python-decouple = "3.8"
 reportlab = "4.3.1"
+django-redis = "*"
 
 [dev-packages]
 
