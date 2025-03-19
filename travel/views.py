@@ -1,44 +1,63 @@
+import logging
+import os
+import requests
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from django.core.cache import cache
+from django.conf import settings
 from .models import Trip, LogEntry, DriverProfile
 from .serializers import TripSerializer
-import requests
-from decouple import config
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
-import os
+
+logger = logging.getLogger(__name__)
 
 class TripPlannerView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        driver, created = DriverProfile.objects.get_or_create(user=request.user)
-        data = request.data.copy()
-        data['driver'] = driver.id
-        serializer = TripSerializer(data=data)
-        if serializer.is_valid():
-            trip = serializer.save()
-            route = self.get_route_with_traffic(trip)
-            plan = self.plan_trip(route, trip.cycle_used)
-            self.save_logs(trip, plan)
-            pdf_path = self.generate_detailed_logs(trip, plan)
-            driver.cycle_hours_remaining -= sum(day['driving'] for day in plan)
-            driver.save()
-            return Response({
-                'route': route,
-                'plan': plan,
-                'pdf_path': pdf_path,
-                'remaining_hours': driver.cycle_hours_remaining
-            })
-        return Response(serializer.errors, status=400)
+        try:
+            logger.info(f"Received POST request with data: {request.data}")
+            driver, created = DriverProfile.objects.get_or_create(user=request.user)
+            logger.info(f"Driver profile: {driver.id}, created: {created}")
+            data = request.data.copy()
+            data['driver'] = driver.id
+            serializer = TripSerializer(data=data)
+            if serializer.is_valid():
+                trip = serializer.save()
+                logger.info(f"Trip saved: {trip.id}")
+                route = self.get_route_with_traffic(trip)
+                logger.info(f"Route fetched: {route}")
+                plan = self.plan_trip(route, trip.cycle_used)
+                logger.info(f"Plan generated: {plan}")
+                self.save_logs(trip, plan)
+                logger.info("Logs saved")
+                pdf_path = self.generate_detailed_logs(trip, plan)
+                logger.info(f"PDF generated at: {pdf_path}")
+                driver.cycle_hours_remaining -= sum(day['driving'] for day in plan)
+                driver.save()
+                logger.info(f"Driver updated, remaining hours: {driver.cycle_hours_remaining}")
+                return Response({
+                    'route': route,
+                    'plan': plan,
+                    'pdf_path': pdf_path,
+                    'remaining_hours': driver.cycle_hours_remaining
+                })
+            logger.error(f"Serializer errors: {serializer.errors}")
+            return Response(serializer.errors, status=400)
+        except Exception as e:
+            logger.error(f"Error in TripPlannerView: {str(e)}", exc_info=True)
+            return Response({"error": str(e)}, status=500)
 
     def get_route_with_traffic(self, trip):
-        access_token = config('MAPBOX_ACCESS_TOKEN')
+        access_token = os.getenv('MAPBOX_ACCESS_TOKEN')
+        if not access_token:
+            raise ValueError("MAPBOX_ACCESS_TOKEN is not set")
         cache_key = f"route_{trip.current_location}_{trip.pickup_location}_{trip.dropoff_location}"
         cached_route = cache.get(cache_key)
         if cached_route:
+            logger.info(f"Using cached route: {cache_key}")
             return cached_route
 
         locations = [trip.current_location, trip.pickup_location, trip.dropoff_location]
@@ -46,14 +65,19 @@ class TripPlannerView(APIView):
         for loc in locations:
             geo_url = f"https://api.mapbox.com/geocoding/v5/mapbox.places/{loc}.json?access_token={access_token}"
             geo_response = requests.get(geo_url).json()
+            if not geo_response.get('features'):
+                raise ValueError(f"Geocoding failed for location: {loc}")
             coordinates.append(geo_response['features'][0]['center'])
 
         coords_str = ';'.join(f"{lon},{lat}" for lon, lat in coordinates)
         url = f"https://api.mapbox.com/directions/v5/mapbox/driving-traffic/{coords_str}?access_token={access_token}&geometries=geojson"
         response = requests.get(url).json()
         
-        distance = response['routes'][0]['distance'] / 1609.34
-        duration = response['routes'][0]['duration'] / 3600
+        if 'routes' not in response or not response['routes']:
+            raise ValueError(f"Directions API failed: {response.get('message', 'No routes found')}")
+        
+        distance = response['routes'][0]['distance'] / 1609.34  # Convert meters to miles
+        duration = response['routes'][0]['duration'] / 3600     # Convert seconds to hours
         route = {
             'distance': distance,
             'duration': duration,
@@ -119,10 +143,11 @@ class TripPlannerView(APIView):
             )
 
     def generate_detailed_logs(self, trip, plan):
-        static_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'static')
+        static_dir = os.path.join(settings.STATIC_ROOT or os.path.join(os.path.dirname(os.path.dirname(__file__)), 'static'), 'logs')
         os.makedirs(static_dir, exist_ok=True)
         
         pdf_path = os.path.join(static_dir, f"logs_trip_{trip.id}.pdf")
+        logger.info(f"Generating PDF at: {pdf_path}")
         c = canvas.Canvas(pdf_path, pagesize=letter)
         c.setFont("Helvetica-Bold", 16)
         c.drawString(50, 780, "Trip Planner Pro - ELD Log")
@@ -158,4 +183,5 @@ class TripPlannerView(APIView):
             if i < len(plan) - 1:
                 c.showPage()
         c.save()
-        return f"static/logs_trip_{trip.id}.pdf"
+        return f"static/logs/logs_trip_{trip.id}.pdf"
+    
