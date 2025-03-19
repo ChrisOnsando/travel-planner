@@ -13,6 +13,7 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 from pathlib import Path
 from decouple import config
 import os
+import dj_database_url
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -27,11 +28,8 @@ SECRET_KEY = config("SECRET_KEY")
 
 DEBUG = config('DEBUG', default=False, cast=bool)
 
-ALLOWED_HOSTS = [
-    'localhost',
-    '127.0.0.1',
-    'https://travel-planner-backend-savs.onrender.com',
-]
+ALLOWED_HOSTS = config("ALLOWED_HOSTS", default="").split(",")
+
 
 CSRF_TRUSTED_ORIGINS = [
     'https://travel-planner-backend-savs.onrender.com',
@@ -89,14 +87,7 @@ WSGI_APPLICATION = 'travelplanner.wsgi.application'
 # https://docs.djangoproject.com/en/5.1/ref/settings/#databases
 
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': config('DB_NAME'),
-        'USER': config('DB_USER'),
-        'PASSWORD': config('DB_PASSWORD'),
-        'HOST': config('DB_HOST', default='localhost'),
-        'PORT': config('DB_PORT', default='5432'),
-    }
+    'default': dj_database_url.config(default=config('DATABASE_URL'))
 }
 
 
@@ -141,10 +132,7 @@ STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-CORS_ALLOWED_ORIGINS = [
-    'http://localhost:3000',  
-    'https://travel-planner-fend.vercel.app',
-]
+CORS_ALLOWED_ORIGINS = config("CORS_ALLOWED_ORIGINS", default="").split(",")
 CORS_ALLOW_ALL_ORIGINS = True  
 
 REST_FRAMEWORK = {
