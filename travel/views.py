@@ -4,7 +4,6 @@ import requests
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from django.core.cache import cache
 from django.conf import settings
 from .models import Trip, LogEntry, DriverProfile
 from .serializers import TripSerializer
@@ -54,11 +53,6 @@ class TripPlannerView(APIView):
         access_token = os.getenv('MAPBOX_ACCESS_TOKEN')
         if not access_token:
             raise ValueError("MAPBOX_ACCESS_TOKEN is not set")
-        cache_key = f"route_{trip.current_location}_{trip.pickup_location}_{trip.dropoff_location}"
-        cached_route = cache.get(cache_key)
-        if cached_route:
-            logger.info(f"Using cached route: {cache_key}")
-            return cached_route
 
         locations = [trip.current_location, trip.pickup_location, trip.dropoff_location]
         coordinates = []
@@ -86,7 +80,6 @@ class TripPlannerView(APIView):
                 'legs': [{'end_location': coord} for coord in coordinates[1:]]
             }
         }
-        cache.set(cache_key, route, timeout=3600)
         return route
 
     def plan_trip(self, route, cycle_used):
@@ -184,4 +177,3 @@ class TripPlannerView(APIView):
                 c.showPage()
         c.save()
         return f"static/logs/logs_trip_{trip.id}.pdf"
-    
